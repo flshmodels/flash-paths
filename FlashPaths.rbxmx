@@ -1,0 +1,257 @@
+<?xml version='1.0' encoding='utf-8'?>
+<roblox version="4">
+  <Item class="Script" referent="RBX0">
+    <Properties>
+      <string name="Name">FlashPaths</string>
+      <ProtectedString name="Source">if not plugin then return end
+local Selection = game:GetService("Selection")
+local RunService = game:GetService("RunService")
+local Ui = require(script.Ui)
+local Adapter = require(script.Adapter)
+local panel = Ui.new(plugin, "FlashPaths", "Flash Paths", "Paths")
+panel.label("Generate an explicit lookup module for the selection. Names are escaped; ambiguous sibling names are refused. No scripts are read, inserted or executed.")
+local output
+local status
+local function clear()
+    if output then output.Text = "" end
+    if status then status.Text = "Selection or options changed. Generate again." end
+end
+local mode = panel.cycle("Lookup", { "Immediate", "Wait (10 seconds per hop)" }, clear)
+status = panel.label("Select up to 50 objects. The result array follows the selection snapshot order.")
+panel.button("Generate lookup module", function()
+    clear()
+    if RunService:IsRunning() then status.Text = "Stop the play test first." return end
+    local ok, result = pcall(Adapter.generate, Selection:Get(), mode() ~= "Immediate")
+    if not ok then status.Text = tostring(result) return end
+    local names = {}
+    for index, record in ipairs(result.records) do table.insert(names, tostring(index) .. ": " .. record.path) end
+    status.Text = table.concat(names, "\n") .. "\nCopy the module below. Resolve it in a context where these services and objects are available."
+    output.Text = result.source
+end)
+output = panel.field("Generated Luau (select and copy)", "")
+output.MultiLine = true
+output.TextEditable = false
+output.ClearTextOnFocus = false
+output.TextXAlignment = Enum.TextXAlignment.Left
+output.TextYAlignment = Enum.TextYAlignment.Top
+output.Font = Enum.Font.Code
+output.TextSize = 13
+output.Size = UDim2.new(1, 0, 0, 400)
+local connection = Selection.SelectionChanged:Connect(clear)
+plugin.Unloading:Connect(function() connection:Disconnect() panel.destroy() end)
+</ProtectedString>
+    </Properties>
+    <Item class="ModuleScript" referent="RBX1">
+      <Properties>
+        <string name="Name">Adapter</string>
+        <ProtectedString name="Source">local Rules = require(script.Parent.Rules)
+local Adapter = {}
+
+function Adapter.generate(selection, waitForChildren)
+    assert(#selection &gt; 0 and #selection &lt;= 50, "Select between 1 and 50 objects.")
+    local records, seen, checkedParents = {}, {}, {}
+    local inspected = 0
+    for _, target in ipairs(selection) do
+        if not seen[target] then
+            assert(target:IsDescendantOf(game), "Selection contains a detached object or the DataModel root.")
+            seen[target] = true
+            local names, cursor = {}, target
+            while cursor.Parent ~= game do
+                assert(cursor.Parent and #names &lt; 64, "Path is detached or exceeds 64 child hops.")
+                local parent = cursor.Parent
+                if not checkedParents[parent] then
+                    local children = parent:GetChildren()
+                    assert(#children &lt;= 10000, "A parent has more than 10000 children.")
+                    inspected += #children
+                    assert(inspected &lt;= 100000, "More than 100000 sibling entries inspected. Select a smaller scope.")
+                    local counts = {}
+                    for _, child in ipairs(children) do counts[child.Name] = (counts[child.Name] or 0) + 1 end
+                    checkedParents[parent] = counts
+                end
+                assert(checkedParents[parent][cursor.Name] == 1, "Ambiguous sibling name: " .. cursor.Name)
+                table.insert(names, 1, cursor.Name)
+                cursor = parent
+            end
+            assert(game:FindService(cursor.ClassName) == cursor, "Top-level ancestor is not a registered service.")
+            table.insert(records, { service = cursor.ClassName, names = names, path = target:GetFullName(), target = target })
+        end
+    end
+    -- Selection order is preserved so the returned array matches the numbered preview.
+    return { records = records, source = Rules.generate(records, waitForChildren) }
+end
+
+return Adapter
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX2">
+      <Properties>
+        <string name="Name">Rules</string>
+        <ProtectedString name="Source">local Rules = {}
+
+function Rules.quote(text)
+    assert(type(text) == "string" and #text &lt;= 4096 and utf8.len(text), "Names must be valid UTF-8 and at most 4096 bytes.")
+    local output = { '"' }
+    for index = 1, #text do
+        local byte = string.byte(text, index)
+        table.insert(output, if byte &gt;= 32 and byte &lt;= 126 and byte ~= 34 and byte ~= 92 then string.char(byte) else string.format("\\%03d", byte))
+    end
+    table.insert(output, '"')
+    return table.concat(output)
+end
+
+function Rules.generate(records, waitForChildren)
+    assert(#records &gt; 0 and #records &lt;= 50, "Select between 1 and 50 objects.")
+    assert(type(waitForChildren) == "boolean", "Choose immediate lookup or wait mode.")
+    local lines = {
+        "-- Generated by Flash Paths. Resolve these objects in the appropriate client/server context.",
+        "local function child(parent, name)",
+    }
+    if waitForChildren then
+        table.insert(lines, '    assert(parent:WaitForChild(name, 10), "Child timed out: " .. name)')
+    end
+    table.insert(lines, '    local found = nil')
+    table.insert(lines, '    local children = parent:GetChildren()')
+    table.insert(lines, '    assert(#children &lt;= 10000, "Parent has too many children")')
+    table.insert(lines, '    for _, item in ipairs(children) do')
+    table.insert(lines, '        if item.Name == name then')
+    table.insert(lines, '            assert(not found, "Ambiguous child name: " .. name)')
+    table.insert(lines, '            found = item')
+    table.insert(lines, '        end')
+    table.insert(lines, '    end')
+    table.insert(lines, '    return assert(found, "Missing child: " .. name)')
+    table.insert(lines, 'end')
+    table.insert(lines, 'return function()')
+    table.insert(lines, '    local refs = {}')
+    for index, record in ipairs(records) do
+        assert(type(record.service) == "string" and record.service:match("^[A-Za-z][A-Za-z0-9]*$"), "Invalid service class.")
+        assert(#record.names &lt;= 64, "A path exceeds 64 child hops.")
+        table.insert(lines, string.format('    local ref%d = game:GetService(%s)', index, Rules.quote(record.service)))
+        for _, name in ipairs(record.names) do
+            table.insert(lines, string.format('    ref%d = child(ref%d, %s)', index, index, Rules.quote(name)))
+        end
+        table.insert(lines, string.format('    refs[%d] = ref%d', index, index))
+    end
+    table.insert(lines, '    return refs')
+    table.insert(lines, 'end')
+    local output = table.concat(lines, "\n") .. "\n"
+    assert(#output &lt;= 65536, "Output exceeds 64 KiB. Select fewer or shallower paths.")
+    return output
+end
+
+return Rules
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX3">
+      <Properties>
+        <string name="Name">Ui</string>
+        <ProtectedString name="Source">local Ui = {}
+
+function Ui.new(plugin, id, title, action)
+    local studio = settings().Studio
+    local colors = {}
+    local connections = {}
+    local toolbar = plugin:CreateToolbar(title)
+    local toggle = toolbar:CreateButton(id, title, "", action)
+    local widget = plugin:CreateDockWidgetPluginGuiAsync(id .. "_v1", DockWidgetPluginGuiInfo.new(
+        Enum.InitialDockState.Right, false, false, 380, 600, 280, 260
+    ))
+    widget.Title = title
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.fromScale(1, 1)
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 6
+    scroll.CanvasSize = UDim2.new()
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+    scroll.Parent = widget
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 14)
+    padding.PaddingBottom = UDim.new(0, 14)
+    padding.PaddingLeft = UDim.new(0, 14)
+    padding.PaddingRight = UDim.new(0, 20)
+    padding.Parent = scroll
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 9)
+    layout.Parent = scroll
+    local order = 0
+    local function theme(object, property, color)
+        table.insert(colors, { object, property, color })
+        object[property] = studio.Theme:GetColor(Enum.StudioStyleGuideColor[color])
+    end
+    theme(scroll, "BackgroundColor3", "MainBackground")
+    theme(scroll, "ScrollBarImageColor3", "MainText")
+    local function add(class, text)
+        order = order + 1
+        local object = Instance.new(class)
+        object.LayoutOrder = order
+        object.Size = UDim2.new(1, 0, 0, 32)
+        object.BorderSizePixel = 0
+        object.Font = Enum.Font.SourceSans
+        object.TextSize = 16
+        object.Text = text
+        object.TextWrapped = true
+        object.Parent = scroll
+        theme(object, "TextColor3", "MainText")
+        return object
+    end
+    local panel = { widget = widget }
+    function panel.label(text)
+        local object = add("TextLabel", text)
+        object.Size = UDim2.new(1, 0, 0, 0)
+        object.AutomaticSize = Enum.AutomaticSize.Y
+        object.BackgroundTransparency = 1
+        object.TextXAlignment = Enum.TextXAlignment.Left
+        return object
+    end
+    function panel.field(caption, initial)
+        panel.label(caption)
+        local object = add("TextBox", initial)
+        object.ClearTextOnFocus = false
+        object.TextWrapped = false
+        theme(object, "BackgroundColor3", "InputFieldBackground")
+        return object
+    end
+    function panel.button(text, callback)
+        local object = add("TextButton", text)
+        theme(object, "BackgroundColor3", "Button")
+        table.insert(connections, object.Activated:Connect(callback))
+        return object
+    end
+    function panel.cycle(caption, choices, changed)
+        local index = 1
+        local button
+        button = panel.button(caption .. ": " .. choices[index], function()
+            index = index % #choices + 1
+            button.Text = caption .. ": " .. choices[index]
+            changed()
+        end)
+        return function() return choices[index] end
+    end
+    panel.label(title)
+    table.insert(connections, toggle.Click:Connect(function() widget.Enabled = not widget.Enabled end))
+    table.insert(connections, widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+        toggle:SetActive(widget.Enabled)
+    end))
+    table.insert(connections, studio.ThemeChanged:Connect(function()
+        for _, item in ipairs(colors) do
+            item[1][item[2]] = studio.Theme:GetColor(Enum.StudioStyleGuideColor[item[3]])
+        end
+    end))
+    toggle:SetActive(widget.Enabled)
+    function panel.destroy()
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        widget:Destroy()
+        toolbar:Destroy()
+    end
+    return panel
+end
+
+return Ui
+</ProtectedString>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>
